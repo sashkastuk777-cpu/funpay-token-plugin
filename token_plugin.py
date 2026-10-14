@@ -19,6 +19,7 @@ token_plugin.py — модуль («плагин») для твоего FunPay-�
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import re
@@ -188,6 +189,34 @@ class SiteClient:
         self.mode = "token" if self.cfg.get("api_token") else "login"
         self._logged_in = False
         self._lock = threading.RLock()
+        # Файл, где хранятся куки сайта. Если ты уже залогинен на сайте
+        # (сессия активна) — бот просто подхватит её и не будет логиниться снова.
+        self.session_file = self.cfg.get("session_file") or "site_session.json"
+        self._load_session()
+
+    # --- сессия между перезапусками ------------------------------------------
+    def _load_session(self):
+        """Подхватывает уже активную сессию сайта (куки) из файла."""
+        try:
+            with open(self.session_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.session.cookies.update(data.get("cookies") or {})
+            if data.get("logged_in"):
+                self._logged_in = True
+                log.info("Подхвачена активная сессия сайта из %s", self.session_file)
+        except (OSError, ValueError):
+            pass
+
+    def _save_session(self):
+        """Сохраняет куки, чтобы при перезапуске не логиниться заново."""
+        try:
+            with open(self.session_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "logged_in": self._logged_in,
+                    "cookies": requests.utils.dict_from_cookiejar(self.session.cookies),
+                }, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            log.warning("Не удалось сохранить сессию: %s", e)
 
     # --- низкоуровневый запрос с ретраями -----------------------------------
     def _request(self, method: str, path: str, **kw):
@@ -244,6 +273,7 @@ class SiteClient:
         if ok_re and not re.search(ok_re, r.text):
             raise SiteError("Не удалось залогиниться на сайт — проверь логин/пароль и success_re")
         self._logged_in = True
+        self._save_session()   # запоминаем сессию — при перезапуске логин не нужен
         log.info("Успешный вход на сайт %s", self.base)
 
     # --- ключи ---------------------------------------------------------------
@@ -340,12 +370,42 @@ class TokenPlugin:
         self.site = SiteClient(cfg.get("site") or {})
         self._seen: Dict[str, PurchaseResult] = {}
         self._lock = threading.Lock()
+        # Функция возврата на FunPay. Присваивается через set_funpay_refund().
+        # Принимает (order_id, amount, buyer) -> bool (True = возврат прошёл).
+        self._funpay_refund_fn = None
 
     @classmethod
     def from_config(cls, path: str = "config.yaml") -> "TokenPlugin":
         with open(path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
         return cls(_deep_merge(DEFAULTS, cfg))
+
+    # ------------------------------------------------------------- возврат
+    def set_funpay_refund(self, fn):
+        """
+        Привязывает функцию возврата на FunPay. Пример для твоего бота:
+
+            plugin.set_funpay_refund(lambda oid, amt, buyer: client.refund(oid))
+
+        Если не привязать — модуль просто пришлёт сообщение про возврат,
+        а сам возврат подтвердишь вручную в админке FunPay.
+        """
+        self._funpay_refund_fn = fn
+
+    def _do_funpay_refund(self, order_id: str, amount: int, buyer: str) -> bool:
+        """Дёргает привязанную функцию возврата на FunPay. Ошибки не роняют бота."""
+        if not self._funpay_refund_fn:
+            return False
+        try:
+            ok = bool(self._funpay_refund_fn(order_id, amount, buyer))
+            if ok:
+                log.info("Возврат на FunPay по заказу %s выполнен", order_id)
+            else:
+                log.warning("Функция возврата FunPay вернула False (заказ %s)", order_id)
+            return ok
+        except Exception:  # noqa: BLE001 — бот не должен падать из-за возврата
+            log.exception("Ошибка функции возврата FunPay (заказ %s)", order_id)
+            return False
 
     # ------------------------------------------------------------------ main
     def handle_purchase(
@@ -406,6 +466,9 @@ class TokenPlugin:
         min_amount = int(self.cfg.get("refund_below") or 0)
         if min_amount and amount < min_amount:
             min_fmt = _fmt(min_amount)
+            # Возврат на FunPay (через твоего бота) — основной путь
+            self._do_funpay_refund(oid, amount, buyer or "")
+            # Плюс возврат на сайте, если настроен refund.path
             self.site.refund(oid, amount, buyer or "")
             log.warning("Автовозврат: заказ %s, %s токенов (< %s), покупатель %s",
                         oid, amount, min_amount, buyer)
