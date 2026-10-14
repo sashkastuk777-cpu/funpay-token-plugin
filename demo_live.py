@@ -18,6 +18,13 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 plugin = TokenPlugin.from_config("config.yaml")
 
+# Привязываем возврат на FunPay через твоего бота.
+# Замени на реальный вызов своего бота, например:
+#   plugin.set_funpay_refund(lambda oid, amt, buyer: client.refund(oid))
+# Пока заглушка — просто пишет в лог, что возврат "сделан".
+plugin.set_funpay_refund(lambda oid, amt, buyer: print(
+    f"    >>> [FunPay] возврат заказа {oid} на {amt} токенов (покупатель {buyer})") or True)
+
 print("=" * 50)
 print("СЦЕНАРИЙ 1: покупка 20 млн (больше 10 млн) -> ключ")
 r1 = plugin.handle_purchase(
