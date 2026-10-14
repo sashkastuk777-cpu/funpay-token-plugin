@@ -59,15 +59,18 @@ SETTINGS = {
     "session_file": "site_session.json",
 
     # --- автовозврат ---
-    "refund_below": 10_000_000,         # меньше этой суммы -> возврат
+    "refund_below": 10_000_000,         # меньше этой суммы -> возврат (= 10 лотов)
     "refund_path": "/api/refund",       # эндпоинт возврата на сайте (пусто = только FunPay)
 
     # URL, который выдаётся покупателю вместе с ключом
     "site_url": "http://5.188.232.230:3456/v1",
 
-    # --- ID лота -> сколько токенов (если нужно фиксировать) ---
-    # пример: "123456789": 2000000
-    "lots": {},
+    # 1 лот = сколько токенов. Покупатель берёт N лотов -> N * tokens_per_lot.
+    "tokens_per_lot": 1_000_000,
+
+    # Фильтр товаров: обрабатывать ТОЛЬКО лоты с этими подстроками в описании.
+    # Пустой список [] = все заказы. Пример: ["токен", "token"]
+    "only_lots": [],
 }
 
 
@@ -313,6 +316,13 @@ class FunPayPlugin:
 
     def _process(self, order_id, buyer, amount, lot_id, item_name, message_text) -> PurchaseResult:
         oid = str(order_id) if order_id is not None else "—"
+        # 1 лот = tokens_per_lot (1 млн). Если передано кол-во (amount) — умножаем.
+        per_lot = int(self.s.get("tokens_per_lot") or 1_000_000)
+        if amount is not None:
+            try:
+                amount = int(amount) * per_lot
+            except (TypeError, ValueError):
+                amount = None
         if amount is None and lot_id is not None:
             amount = (self.s.get("lots") or {}).get(str(lot_id))
         if amount is None:
