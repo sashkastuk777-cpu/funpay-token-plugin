@@ -85,6 +85,9 @@ class PurchaseResult:
     message: str = ""                  # готовый текст для отправки покупателю
     duplicate: bool = False            # True — этот заказ уже обрабатывался
     error: Optional[str] = None        # текст ошибки (для логов/админа)
+    refund: bool = False               # True — сработал автовозврат (< min_amount)
+    order_id: Optional[str] = None     # номер заказа (для логов/уведомлений)
+    admin_note: str = ""               # текст для уведомления админа (если есть)
 
 
 class SiteError(Exception):
@@ -129,8 +132,31 @@ DEFAULTS: Dict[str, Any] = {
         "lots": {},
         "parse_from_text": True,        # понимать «2кк» / «2000000» из названия/текста
     },
+    "refund_below": 10_000_000,         # если куплено МЕНЬШЕ этой суммы — автовозврат
+    "refund": {
+        "path": "/api/refund",          # эндпоинт возврата на твоём сайте (если пусто — только сообщение)
+        "method": "POST",
+        "as_json": False,
+        "order_field": "order_id",
+        "amount_field": "amount",
+        "username_field": "username",
+        "extra_fields": {},
+    },
     "messages": {
-        "success": "✅ Оплата получена! Вам начислено {amount_formatted} токенов.\n🔑 Ваш ключ: {key}",
+        "success": (
+            "✅ Оплата получена!\n"
+            "📦 Заказ: {order_id}\n"
+            "💰 Сумма: {amount_formatted} токенов\n"
+            "🔑 Ваш ключ: {key}"
+        ),
+        "refunded": (
+            "❌ Заказ отменён, оформляем возврат.\n"
+            "📦 Заказ: {order_id}\n"
+            "💰 Сумма: {amount_formatted} токенов\n"
+            "ℹ️ Минимальная сумма покупки — {min_amount_formatted} токенов.\n"
+            "Деньги вернутся на ваш способ оплаты автоматически."
+        ),
+        "refund_admin": "🔁 Автовозврат: заказ {order_id}, {amount_formatted} токенов (меньше {min_amount_formatted}), покупатель {buyer}",
         "no_amount": "⚠️ Не смог определить количество токенов в заказе. Напишите администратору.",
         "error": "⚠️ Произошла ошибка при выдаче ключей, администратор уже в курсе.",
     },
@@ -272,6 +298,38 @@ class SiteClient:
                 return (m.group(1) if m.groups() else m.group(0)).strip()
         return None
 
+    # --- возврат ---------------------------------------------------------------
+    def refund(self, order_id: str, amount: int, buyer: str = "") -> bool:
+        """
+        Дёргает эндпоинт возврата на твоём сайте.
+        Если refund.path пустой — возвращает False (возврат сделает сама
+        платёжка/FunPay, модуль только уведомит).
+        """
+        rc = self.cfg.get("refund") or {}
+        if not rc.get("path"):
+            return False
+        if self.dry_run:
+            log.info("[dry-run] возврат заказа %s (%s токенов)", order_id, amount)
+            return True
+        data: Dict[str, Any] = {
+            rc.get("order_field", "order_id"): order_id,
+            rc.get("amount_field", "amount"): amount,
+        }
+        if rc.get("username_field"):
+            data[rc["username_field"]] = buyer
+        data.update(rc.get("extra_fields") or {})
+        method = str(rc.get("method", "POST")).upper()
+        if method == "GET":
+            r = self._api("GET", rc["path"], params=data)
+        else:
+            r = self._api("POST", rc["path"],
+                          json=data if rc.get("as_json") else None,
+                          data=None if rc.get("as_json") else data)
+        if r.status_code >= 400:
+            raise SiteError(f"Возврат не прошёл (HTTP {r.status_code}): {r.text[:200]}")
+        log.info("Возврат по заказу %s выполнен", order_id)
+        return True
+
 
 # ----------------------------------------------------------------------------
 # Сам плагин
@@ -310,15 +368,19 @@ class TokenPlugin:
                 if key in self._seen:
                     prev = self._seen[key]
                     return PurchaseResult(prev.ok, prev.key, prev.amount, prev.message,
-                                          duplicate=True, error=prev.error)
+                                          duplicate=True, error=prev.error,
+                                          refund=prev.refund, order_id=prev.order_id,
+                                          admin_note=prev.admin_note)
         try:
-            result = self._process(buyer_username, amount, lot_id, item_name, message_text)
+            result = self._process(order_id, buyer_username, amount, lot_id, item_name, message_text)
         except SiteError as e:
             log.exception("Ошибка при обработке покупки (заказ %s)", order_id)
-            result = PurchaseResult(False, error=str(e), message=self._msg("error"))
+            result = PurchaseResult(False, error=str(e), message=self._msg("error"),
+                                    order_id=str(order_id) if order_id is not None else None)
         except Exception as e:  # noqa: BLE001 — бот не должен падать из-за модуля
             log.exception("Непредвиденная ошибка модуля ключей")
-            result = PurchaseResult(False, error=str(e), message=self._msg("error"))
+            result = PurchaseResult(False, error=str(e), message=self._msg("error"),
+                                    order_id=str(order_id) if order_id is not None else None)
         if key:
             with self._lock:
                 self._seen[key] = result
@@ -327,7 +389,8 @@ class TokenPlugin:
         return result
 
     # ----------------------------------------------------------- внутренняя
-    def _process(self, buyer, amount, lot_id, item_name, message_text) -> PurchaseResult:
+    def _process(self, order_id, buyer, amount, lot_id, item_name, message_text) -> PurchaseResult:
+        oid = str(order_id) if order_id is not None else "—"
         ac = self.cfg.get("amounts") or {}
         if amount is None and lot_id is not None:
             amount = (ac.get("lots") or {}).get(str(lot_id))
@@ -335,15 +398,30 @@ class TokenPlugin:
             amount = parse_tokens(item_name) or parse_tokens(message_text)
         if not amount or int(amount) <= 0:
             return PurchaseResult(False, error="Не удалось определить количество токенов",
-                                  message=self._msg("no_amount"))
+                                  message=self._msg("no_amount"), order_id=oid)
         amount = int(amount)
         fmt = _fmt(amount)
+
+        # --- автовозврат: куплено меньше минимума -----------------------------
+        min_amount = int(self.cfg.get("refund_below") or 0)
+        if min_amount and amount < min_amount:
+            min_fmt = _fmt(min_amount)
+            self.site.refund(oid, amount, buyer or "")
+            log.warning("Автовозврат: заказ %s, %s токенов (< %s), покупатель %s",
+                        oid, amount, min_amount, buyer)
+            return PurchaseResult(
+                True, amount=amount, order_id=oid, refund=True,
+                message=self._msg("refunded", order_id=oid, amount_formatted=fmt,
+                                  min_amount_formatted=min_fmt),
+                admin_note=self._msg("refund_admin", order_id=oid, amount_formatted=fmt,
+                                     min_amount_formatted=min_fmt, buyer=buyer or "—"),
+            )
 
         # Вход на сайт — под ТВОИМ аккаунтом (Sashka). Покупателю аккаунт
         # на сайте не нужен: создаём ключ и отдаём его ему в чат.
         key = self.site.create_key(amount, buyer or "")
-        msg = self._msg("success", amount_formatted=fmt, key=key)
-        return PurchaseResult(True, key=key, amount=amount, message=msg)
+        msg = self._msg("success", order_id=oid, amount_formatted=fmt, key=key)
+        return PurchaseResult(True, key=key, amount=amount, order_id=oid, message=msg)
 
     def _msg(self, name: str, **kwargs) -> str:
         templates = self.cfg.get("messages") or {}
