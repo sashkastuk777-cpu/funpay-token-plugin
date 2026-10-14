@@ -62,6 +62,9 @@ SETTINGS = {
     "refund_below": 10_000_000,         # меньше этой суммы -> возврат
     "refund_path": "/api/refund",       # эндпоинт возврата на сайте (пусто = только FunPay)
 
+    # URL, который выдаётся покупателю вместе с ключом
+    "site_url": "http://5.188.232.230:3456/v1",
+
     # --- ID лота -> сколько токенов (если нужно фиксировать) ---
     # пример: "123456789": 2000000
     "lots": {},
@@ -340,10 +343,13 @@ class FunPayPlugin:
 
         # --- ключ ---
         key = self.site.create_key(amount, buyer or "")
+        site_url = self.s.get("site_url", "")
+        url_line = f"\n🌐 Адрес: {site_url}" if site_url else ""
         msg = (f"✅ Оплата получена!\n"
                f"📦 Заказ: {oid}\n"
                f"💰 Сумма: {fmt} токенов\n"
-               f"🔑 Ваш ключ: {key}")
+               f"🔑 Ваш ключ: {key}"
+               f"{url_line}")
         return PurchaseResult(True, key=key, amount=amount, order_id=oid, message=msg)
 
 
