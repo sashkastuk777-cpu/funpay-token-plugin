@@ -1,6 +1,34 @@
 # funpay-token-plugin
 
 Модуль для твоего FunPay-бота на Python.
+
+## ⭐ Быстрый старт (один файл)
+
+Бери **`funpay_plugin.py`** — это всё в одном файле, без `config.yaml`.
+
+1. Положи `funpay_plugin.py` рядом со своим ботом
+2. Впиши `base_url` своего сайта в блок `SETTINGS` сверху файла
+3. Подключи в боте (пример в самом низу файла):
+
+```python
+from funpay_plugin import FunPayPlugin
+
+plugin = FunPayPlugin()
+plugin.set_funpay_refund(lambda oid, amt, buyer: client.refund(oid))  # возврат на FunPay
+
+# когда пришла покупка:
+r = plugin.handle_purchase(order_id="123", buyer_username="Вася", item_name="2кк")
+if r.message:
+    send_to_chat("Вася", r.message)
+```
+
+Проверка без бота: `python funpay_plugin.py` (см. `if __name__ == "__main__"` внизу файла).
+
+---
+
+## Подробная версия (с config.yaml)
+
+Ниже — раздельная версия с настройками через `config.yaml` (`token_plugin.py`).
 Когда человек покупает токены, бот **заходит на твой сайт под твоим аккаунтом (Sashka)**, создаёт ключ на нужное количество токенов и отдаёт его покупателю в чат.
 
 Покупателю аккаунт на сайте **не создаётся** — он получает только ключ.
